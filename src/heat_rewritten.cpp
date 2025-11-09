@@ -33,13 +33,10 @@ int main(int argc, char** argv){
     if (rank == n_proc - 1) end = grid_x;
 
     // Tamaño local en X e Y
-    int local_grid_x = end - start; // número de columnas reales que manejo
+    int local_grid_x = end - start; // numero de columnas reales que manejo
     int local_grid_y = grid_y;      // particion solo en x
 
     // +2 por halos (ghost columns/rows)
-    // NOTE: We choose a layout: idx(x,y) = y*(local_grid_x+2) + x
-    // so x is the fastest (inner index). This means a vertical column (fixed x)
-    // has stride (local_grid_x+2) between successive y elements -> needs an MPI vector.
     int stride = local_grid_x + 2;
     size_t phi_size = (size_t)(local_grid_x + 2) * (size_t)(local_grid_y + 2);
 
