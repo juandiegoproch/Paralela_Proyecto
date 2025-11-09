@@ -4,8 +4,8 @@
 #define min(A,B) ((A) < (B) ? (A) : (B))
 #define max(A,B) ((A) > (B) ? (A) : (B))
 
-const int imax = 80;
-const int kmax = 80;
+const int imax = 8;
+const int kmax = 8;
 const int itmax = 20000;
 
 int main()
@@ -43,6 +43,13 @@ int main()
   {
     phi[0][k]=phi[0][k-1]+dx;
     phi[imax][k]=phi[imax][k-1]+dx;
+  }
+
+    for (i=0; i<imax+1;i++){
+    for (k=0; k<kmax+1;k++){
+      std::cout << phi[i][k] << ", ";
+    }
+    std::cout << "\n";
   }
 
   printf("\nTransmision de calor 2d\n");
