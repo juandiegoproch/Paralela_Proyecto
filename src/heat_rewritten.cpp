@@ -3,6 +3,7 @@
 #include <cstring>
 #include <iostream>
 #include <mpi.h>
+#include <omp.h>
 
 int main(int argc, char** argv){
     // Parametros del problema
@@ -46,6 +47,7 @@ int main(int argc, char** argv){
     auto idx = [stride](int x, int y){ return y * stride + x; };
 
     // condiciones iniciales y de frontera
+    #pragma omp parallel for collapse(2)
     for (int x = 0; x < local_grid_x + 2; ++x) {
         for (int y = 0; y < local_grid_y + 2; ++y) {
             if (x == 0 || x == local_grid_x + 1) {
@@ -96,6 +98,7 @@ int main(int argc, char** argv){
         if (r) MPI_Waitall(r, reqs, MPI_STATUSES_IGNORE);
 
         // update interior points (use local indices x=1..local_grid_x, y=1..local_grid_y)
+        #pragma omp parallel for collapse(2)
         for (int x = 1; x <= local_grid_x; ++x) {
             for (int y = 1; y <= local_grid_y; ++y) {
                 double upper_neighbour = phi[idx(x, y - 1)];
@@ -115,6 +118,7 @@ int main(int argc, char** argv){
     }
     // copy without the halos
     std::vector<double> partial_result(local_grid_x * local_grid_y);
+    #pragma omp parallel for collapse(2)
     for (int y = 1; y <= local_grid_y; ++y) {
         for (int x = 1; x <= local_grid_x; ++x) {
             partial_result[(y - 1) * local_grid_x + (x - 1)] = phi[idx(x, y)];
