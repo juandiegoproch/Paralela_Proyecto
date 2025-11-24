@@ -1,85 +1,183 @@
 #!/bin/bash
 
-# Cross-platform run script for MPI+OpenMP heat equation solver
-# Supports macOS and Linux
+# Master run script for Heat Equation Solver
+# 1. Compiles on Login Node
+# 2. Submits to Slurm
+# 3. Monitors Output automatically
 
-set -e  # Exit on error
+set -e
 
-# Default values
-NP=${NP:-4}              # Number of MPI processes
-OMP_THREADS=${OMP_NUM_THREADS:-2}  # OpenMP threads per process
+# Configuration
+NP=${NP:-4}
+OMP_THREADS=${OMP_NUM_THREADS:-2}
+SLURM_FILE="heat.slurm"
 SRC_DIR="src"
 BINARY="heat_rewritten"
 SOURCE="${SRC_DIR}/heat_rewritten.cpp"
+JOB_NAME="heat_solver"
 
-# Detect OS
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    OS="macos"
-elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    OS="linux"
-else
-    echo "Warning: Unknown OS type: $OSTYPE. Assuming Linux..."
-    OS="linux"
-fi
+# Modules matching your system
+GCC_MODULE="gnu12"
+MPI_MODULE="openmpi4"
+PMIX_MODULE="pmix"
 
-echo "Detected OS: $OS"
-echo "MPI processes: $NP"
-echo "OpenMP threads per process: $OMP_THREADS"
+echo "=================================================="
+echo "   HPC Heat Equation Solver - Automated Runner"
+echo "=================================================="
+echo "Configuration:"
+echo "  MPI Processes:      $NP"
+echo "  OpenMP Threads:     $OMP_THREADS"
+echo "  Partition:          standard"
+echo "  Modules:            $GCC_MODULE, $MPI_MODULE"
+echo "=================================================="
 echo ""
 
-# Check if source file exists
+# ---------------------------------------------------------
+# 1. Compilation (Login Node)
+# ---------------------------------------------------------
+echo "[1/3] Compiling on login node..."
+
+# Load modules for compilation
+if command -v ml &> /dev/null; then
+    ml load "$GCC_MODULE" "$MPI_MODULE" "$PMIX_MODULE" 2>/dev/null || true
+elif command -v module &> /dev/null; then
+    module load "$GCC_MODULE" "$MPI_MODULE" "$PMIX_MODULE" 2>/dev/null || true
+fi
+
+# Compile
 if [ ! -f "$SOURCE" ]; then
-    echo "Error: Source file not found: $SOURCE"
+    echo "Error: Source file $SOURCE not found!"
     exit 1
 fi
 
-# Compile with platform-specific flags
-echo "Compiling..."
-if [ "$OS" == "macos" ]; then
-    # macOS (clang) requires special OpenMP flags
-    if command -v brew &> /dev/null; then
-        LIBOMP_PREFIX=$(brew --prefix libomp 2>/dev/null || echo "")
-        if [ -n "$LIBOMP_PREFIX" ]; then
-            # Homebrew libomp is installed
-            mpic++ -Xpreprocessor -fopenmp -lomp \
-                   -I"${LIBOMP_PREFIX}/include" \
-                   -L"${LIBOMP_PREFIX}/lib" \
-                   -o "${SRC_DIR}/${BINARY}" \
-                   "$SOURCE"
-        else
-            # Try without explicit paths (might work if libomp is in system paths)
-            mpic++ -Xpreprocessor -fopenmp -lomp \
-                   -o "${SRC_DIR}/${BINARY}" \
-                   "$SOURCE" || {
-                echo "Error: OpenMP not found. Install with: brew install libomp"
-                exit 1
-            }
-        fi
-    else
-        # No Homebrew, try system paths
-        mpic++ -Xpreprocessor -fopenmp -lomp \
-               -o "${SRC_DIR}/${BINARY}" \
-               "$SOURCE" || {
-            echo "Error: OpenMP not found. Install libomp or use Homebrew."
-            exit 1
-        }
-    fi
-else
-    # Linux (usually GCC) - standard OpenMP flag
-    mpic++ -fopenmp -o "${SRC_DIR}/${BINARY}" "$SOURCE"
-fi
-
-if [ $? -ne 0 ]; then
-    echo "Compilation failed!"
-    exit 1
-fi
-
-echo "Compilation successful!"
+mpic++ -fopenmp -o "${SRC_DIR}/${BINARY}" "$SOURCE"
+echo "      Success! Binary created at ${SRC_DIR}/${BINARY}"
 echo ""
 
-# Run the program
-echo "Running..."
-cd "$SRC_DIR"
-export OMP_NUM_THREADS=$OMP_THREADS
-mpirun -np "$NP" ./"$BINARY"
+# ---------------------------------------------------------
+# 2. Job Submission
+# ---------------------------------------------------------
+echo "[2/3] Submitting Slurm job..."
 
+if [ ! -f "$SLURM_FILE" ]; then
+    echo "Error: Slurm file $SLURM_FILE not found!"
+    exit 1
+fi
+
+# Auto-detect user's default account for standard partition
+# Try to get default account, fallback to first available account
+DEFAULT_ACCOUNT=$(sacctmgr show user $USER withassoc format=defaultaccount -n 2>/dev/null | head -1 | awk '{print $1}')
+if [ -z "$DEFAULT_ACCOUNT" ]; then
+    DEFAULT_ACCOUNT=$(sacctmgr show user $USER withassoc format=account -n 2>/dev/null | head -1 | awk '{print $1}')
+fi
+
+# Get absolute path to current directory for Slurm
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Submit and extract Job ID
+# Add account if we found one (standard partition may require it)
+# Use --chdir to ensure job starts in the correct directory
+SBATCH_ARGS="--ntasks=$NP --cpus-per-task=$OMP_THREADS --job-name=$JOB_NAME --chdir=$SCRIPT_DIR"
+if [ -n "$DEFAULT_ACCOUNT" ]; then
+    SBATCH_ARGS="$SBATCH_ARGS --account=$DEFAULT_ACCOUNT"
+    echo "      Using account: $DEFAULT_ACCOUNT"
+fi
+
+OUTPUT=$(sbatch $SBATCH_ARGS "$SLURM_FILE" 2>&1)
+SUBMIT_SUCCESS=$?
+
+if [ $SUBMIT_SUCCESS -ne 0 ]; then
+    echo "Error: Job submission failed!"
+    echo "$OUTPUT"
+    exit 1
+fi
+
+# Extract Job ID from output
+JOB_ID=$(echo "$OUTPUT" | awk '/Submitted batch job/ {print $4}')
+
+if [[ -z "$JOB_ID" ]] || [[ ! "$JOB_ID" =~ ^[0-9]+$ ]]; then
+    echo "Error: Could not extract Job ID from submission output:"
+    echo "$OUTPUT"
+    exit 1
+fi
+
+echo "      Job submitted! ID: $JOB_ID"
+echo ""
+
+# ---------------------------------------------------------
+# 3. Monitoring
+# ---------------------------------------------------------
+echo "[3/3] Monitoring job $JOB_ID..."
+echo "      Waiting for job to start..."
+
+# Wait for job to start running
+while true; do
+    STATE=$(squeue -j "$JOB_ID" -h -o %T 2>/dev/null || echo "COMPLETED")
+    
+    if [ "$STATE" == "RUNNING" ]; then
+        echo "      Job is RUNNING."
+        break
+    elif [ "$STATE" == "COMPLETED" ] || [ "$STATE" == "FAILED" ] || [ "$STATE" == "CANCELLED" ] || [ "$STATE" == "TIMEOUT" ]; then
+        echo "      Job finished before monitoring could start (very fast run?)."
+        break
+    elif [ -z "$STATE" ]; then
+        # Job disappeared from queue
+        echo "      Job finished."
+        break
+    fi
+    sleep 1
+done
+
+# Define output files
+OUT_FILE="slurm-${JOB_ID}.out"
+ERR_FILE="slurm-${JOB_ID}.err"
+
+# Wait for output file to appear (Slurm can be slightly delayed writing it)
+echo "      Waiting for output files..."
+MAX_RETRIES=10
+count=0
+while [ ! -f "$OUT_FILE" ] && [ $count -lt $MAX_RETRIES ]; do
+    sleep 1
+    ((count++))
+    # If job is already done, files might be ready
+    if ! squeue -j "$JOB_ID" &>/dev/null; then
+        break
+    fi
+done
+
+echo ""
+echo "================ JOB OUTPUT ================"
+
+# Tail the output file if it exists
+if [ -f "$OUT_FILE" ]; then
+    # Use tail -f --pid to follow until the tail process is killed or file stops growing? 
+    # Better: loop while job is running or just cat at the end if short.
+    # For robust "live" monitoring:
+    tail -f "$OUT_FILE" &
+    TAIL_PID=$!
+    
+    # Wait until job finishes
+    while squeue -j "$JOB_ID" &>/dev/null; do
+        sleep 2
+    done
+    
+    # Kill tail
+    kill $TAIL_PID 2>/dev/null || true
+    
+    # Show any remaining lines
+    echo "--- Final Output ---"
+    cat "$OUT_FILE"
+else
+    echo "Warning: Output file $OUT_FILE not found yet."
+fi
+
+echo "============================================"
+
+# Check for errors
+if [ -f "$ERR_FILE" ] && [ -s "$ERR_FILE" ]; then
+    echo "STDERR content:"
+    cat "$ERR_FILE"
+    echo "============================================"
+fi
+
+echo "Done."
